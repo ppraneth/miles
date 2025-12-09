@@ -1,0 +1,106 @@
+import miles.utils.external_utils.command_utils as U
+
+MODEL_NAME = "Qwen3-0.6B"
+
+
+FEW_GPU = U.get_bool_env_var("MILES_TEST_FEW_GPU", "1")
+
+
+def prepare():
+    U.exec_command("mkdir -p /root/models /root/datasets")
+    U.exec_command(f"huggingface-cli download Qwen/{MODEL_NAME} --local-dir /root/models/{MODEL_NAME}")
+    U.hf_download_dataset("zhuzilin/gsm8k")
+
+
+def execute():
+    ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME} "
+
+    router_args = (
+        "--use-miles-router "
+        "--miles-router-middleware-paths miles.router.middleware_hub.radix_tree_middleware.RadixTreeMiddleware "
+    )
+
+    rollout_args = (
+        "--prompt-data /root/datasets/gsm8k/train.parquet "
+        "--input-key messages "
+        "--label-key label "
+        "--apply-chat-template "
+        "--rollout-shuffle "
+        "--rm-type math "
+        # Run enough rollouts to ensure we hit the condition
+        f"--num-rollout {3000 if U.get_env_enable_infinite_run() else 65} "
+        "--rollout-batch-size 32 "
+        "--n-samples-per-prompt 8 "
+        "--rollout-temperature 0.8 "
+        "--over-sampling-batch-size 64 "
+        "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std "
+        "--global-batch-size 256 "
+        # 2. TRIGGER THE BUG: FORCE ZERO LENGTH RESPONSES
+        # We set the stop token to a very common character (like "1" or "The")
+        # to force the model to stop immediately, producing a 0-length response.
+        # This forces the logic `sample.loss_mask[-sample.response_length :]` to execute as `[-0:]`.
+        "--rollout-stop 1 "
+        # Alternatively, restrict max len to 1 (though stop tokens are more reliable for forcing 0 len)
+        "--rollout-max-response-len 2 "
+    )
+
+    eval_args = (
+        "--eval-interval 20 "
+        "--eval-prompt-data gsm8k /root/datasets/gsm8k/test.parquet "
+        "--n-samples-per-eval-prompt 1 "
+        "--eval-max-response-len 1024 "
+        "--eval-top-k 1 "
+    )
+
+    grpo_args = (
+        "--advantage-estimator grpo "
+        # "--use-kl-loss "
+        "--kl-loss-coef 0.00 "
+        "--kl-loss-type low_var_kl "
+        "--kl-coef 0.00 "
+        "--entropy-coef 0.00 "
+        "--eps-clip 0.2 "
+        "--eps-clip-high 0.28 "
+    )
+
+    optimizer_args = (
+        "--optimizer adam "
+        "--lr 1e-6 "
+        "--lr-decay-style constant "
+        "--weight-decay 0.1 "
+        "--adam-beta1 0.9 "
+        "--adam-beta2 0.98 "
+    )
+
+    sglang_args = "--rollout-num-gpus-per-engine 1 " "--sglang-enable-metrics "
+
+    misc_args = (
+        "--actor-num-nodes 1 "
+        f"--actor-num-gpus-per-node {1 if FEW_GPU else 2} "
+        f"--rollout-num-gpus {1 if FEW_GPU else 2} "
+        "--train-backend fsdp "
+    )
+
+    train_args = (
+        f"{ckpt_args} "
+        f"{router_args} "
+        f"{rollout_args} "
+        f"{optimizer_args} "
+        f"{grpo_args} "
+        f"{U.get_default_wandb_args(__file__)} "
+        f"{eval_args} "
+        f"{sglang_args} "
+        f"{misc_args} "
+    )
+
+    U.execute_train(
+        train_args=train_args,
+        num_gpus_per_node=2 if FEW_GPU else 4,
+        megatron_model_type=None,
+        train_script="train_async.py",
+    )
+
+
+if __name__ == "__main__":
+    prepare()
+    execute()

@@ -156,7 +156,7 @@ def compute_sapo_loss(
 
     # Select temperature based on advantage sign
     # Asymmetric: higher tau_neg dampens negative token gradients more aggressively
-    # This is critical for training stability (see paper Section 3, Equation 9)
+    # This is critical for training stability
     tau = torch.where(
         advantages > 0,
         torch.tensor(tau_pos, device=advantages.device, dtype=advantages.dtype),

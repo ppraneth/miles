@@ -1,5 +1,6 @@
 """Data packing utilities for FSDP backend to reduce padding overhead."""
 
+import itertools
 import math
 
 import torch
@@ -100,18 +101,20 @@ def pack_sequences(
             ),
         }
 
-        # Collect and add multimodal training tensors for this partition
         if multimodal_train_inputs:
-            multimodal_data = {}  # key -> concatenated tensor
+            multimodal_tensors_list = {}  # key -> list of tensors to concatenate
             multimodal_num_items = {}  # key -> list of item counts per sequence
             for i in indices:
                 for key, mm_tensor in multimodal_train_inputs[i].items():
-                    if key not in multimodal_data:
-                        multimodal_data[key] = mm_tensor
+                    if key not in multimodal_tensors_list:
+                        multimodal_tensors_list[key] = [mm_tensor]
                         multimodal_num_items[key] = [mm_tensor.size(0)]
                     else:
-                        multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
+                        multimodal_tensors_list[key].append(mm_tensor)
                         multimodal_num_items[key].append(mm_tensor.size(0))
+
+            # Final single concatenation for each multimodal modality
+            multimodal_data = {key: torch.cat(tensors, dim=0) for key, tensors in multimodal_tensors_list.items()}
             packed_batch["multimodal_train_inputs"] = multimodal_data
             packed_batch["multimodal_num_items"] = multimodal_num_items
 
@@ -136,59 +139,53 @@ def unpack_sequences(packed_batch: dict) -> list[dict]:
     response_lengths = packed_batch["response_lengths"]
     multimodal_num_items = packed_batch.get("multimodal_num_items", {})
 
+    mm_offsets = {k: list(itertools.accumulate(v, initial=0)) for k, v in multimodal_num_items.items()}
+    resp_offsets = list(itertools.accumulate(response_lengths, initial=0))
+
     instances = []
 
     # Calculate pad_length by counting trailing zeros
     tokens = packed_batch["tokens"]
     nonzero_indices = (tokens != 0).nonzero(as_tuple=True)[0]
     if len(nonzero_indices) > 0:
-        # Last non-zero index, pad_length is everything after it
         pad_length = len(tokens) - nonzero_indices[-1].item() - 1
     else:
-        pad_length = 0  # No padding if no non-zero tokens (or all zeros)
+        pad_length = 0
+
     for i in range(num_sequences):
         start_idx = cu_seqlens[i].item()
         end_idx = cu_seqlens[i + 1].item()
         instance = {}
 
-        # Copy any additional attributes that might exist in the packed batch
+        # Copy and slice attributes
         for key, value in packed_batch.items():
-            if key not in instance:
-                # Skip multimodal_num_items - it's metadata
-                if key == "multimodal_num_items":
-                    continue
-                # Handle multimodal_train_inputs dict: split each tensor using multimodal_num_items
-                elif key == "multimodal_train_inputs" and isinstance(value, dict):
-                    instance[key] = {}
-                    for mm_key, mm_tensor in value.items():
-                        if mm_key in multimodal_num_items:
-                            num_items_list = multimodal_num_items[mm_key]
-                            start_mm_idx = sum(num_items_list[:i])
-                            end_mm_idx = start_mm_idx + num_items_list[i]
-                            if num_items_list[i] > 0:
-                                instance[key][mm_key] = mm_tensor[start_mm_idx:end_mm_idx]
-                # For tensor attributes, we need to slice them appropriately
-                elif isinstance(value, torch.Tensor):
-                    if key in ["log_probs", "ref_log_probs", "cur_log_probs", "entropy"]:
-                        # These are computed from logits[:-1] so they have length seq_len-1
-                        instance[key] = value[
-                            end_idx - 1 - response_lengths[i] - pad_length : end_idx - 1 - pad_length
-                        ]
-                    elif key == "rollout_log_probs":
-                        # rollout_log_probs is packed based on response_lengths, so slice differently
-                        instance[key] = value[sum(response_lengths[:i]) : sum(response_lengths[: i + 1])]
-                    elif key in ["tokens", "position_ids"]:
-                        # For other tensor attributes, try to slice them
-                        if len(value) > start_idx:
-                            instance[key] = value[start_idx:end_idx]
-                        else:
-                            raise ValueError(f"Attribute {key} is not found in the packed batch")
-                    elif key in ["loss_masks", "advantages", "returns"]:
-                        instance[key] = value[sum(response_lengths[:i]) : sum(response_lengths[: i + 1])]
-                elif isinstance(value, list):
-                    instance[key] = value[i]
-                else:
-                    raise ValueError(f"Attribute {key} is not found in the packed batch")
+            if key == "multimodal_num_items":
+                continue
+
+            # Handle multimodal training tensors: O(1) slice using pre-calculated offsets
+            elif key == "multimodal_train_inputs" and isinstance(value, dict):
+                instance[key] = {}
+                for mm_key, mm_tensor in value.items():
+                    if mm_key in mm_offsets:
+                        start_mm_idx = mm_offsets[mm_key][i]
+                        end_mm_idx = mm_offsets[mm_key][i + 1]
+                        if end_mm_idx > start_mm_idx:
+                            instance[key][mm_key] = mm_tensor[start_mm_idx:end_mm_idx]
+
+            elif isinstance(value, torch.Tensor):
+                # These use end_idx directly and are O(1)
+                if key in ["log_probs", "ref_log_probs", "cur_log_probs", "entropy"]:
+                    instance[key] = value[end_idx - 1 - response_lengths[i] - pad_length : end_idx - 1 - pad_length]
+                # Slicing packed sequence tensors: O(1) using pre-calculated offsets
+                elif key == "rollout_log_probs" or key in ["loss_masks", "advantages", "returns"]:
+                    instance[key] = value[resp_offsets[i] : resp_offsets[i + 1]]
+                elif key in ["tokens", "position_ids"]:
+                    instance[key] = value[start_idx:end_idx]
+
+            elif isinstance(value, list):
+                instance[key] = value[i]
+            else:
+                raise ValueError(f"Attribute {key} is not found in the packed batch")
 
         instances.append(instance)
 
